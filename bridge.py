@@ -451,15 +451,27 @@ def _result(job_id, refresh=True):
 
 
 def _stop(process):
+    # A known return code means the leader has already been reaped. Its PID
+    # may now identify an unrelated process group, so do not signal it again.
+    if process.returncode is not None:
+        return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            pass
+            break
+        except PermissionError:
+            if process.poll() is not None:
+                return
+            raise BridgeError('cleanup_failed', 'The owned provider process group could not be stopped.') from None
+        if sig == signal.SIGTERM:
+            # Do not poll/wait here: retaining the unreaped leader's PID
+            # prevents reuse while children get a short graceful-stop window.
+            time.sleep(0.2)
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        raise BridgeError('cleanup_failed', 'The owned provider did not stop after termination.') from None
 
 
 def _run(args, cwd, timeout, stdin=''):
@@ -514,9 +526,11 @@ def _run(args, cwd, timeout, stdin=''):
         return code, buffers['stdout'].decode('utf-8', 'replace'), buffers['stderr'].decode('utf-8', 'replace')
     finally:
         selector.close()
-        _stop(process)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            stream.close()
+        try:
+            _stop(process)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
 
 
 def _failure(raw, default='provider_failed'):

@@ -180,23 +180,69 @@ def _http(method, route, deadline, payload=None, timeout_cap=None):
 
 def _stop_owned(process):
     # The deadline watchdog and the main thread can both reach cleanup.
-    # Stop each owned group once, never signal a potentially reused group ID.
+    # Keep the unreaped leader's PID reserved until every group signal has
+    # been sent. wait()/poll() between TERM and KILL would release that anchor.
     with process._qwen_cleanup_lock:
         if process._qwen_cleanup_complete:
             return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        error = getattr(process, '_qwen_cleanup_error', None)
+        if error:
+            raise LocalQwenError('cleanup_failed', error)
+        if process.returncode is not None:
+            process._qwen_cleanup_error = 'The local runner leader was already reaped; its process group cannot be safely verified.'
+            raise LocalQwenError('cleanup_failed', process._qwen_cleanup_error)
+        group_gone = False
+        try:
             try:
-                os.killpg(process.pid, sig)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
-            except PermissionError:
-                if process.poll() is None:
-                    raise LocalQwenError('cleanup_failed', 'The owned local runner could not be stopped.') from None
+                group_gone = True
+            if not group_gone:
+                time.sleep(0.3)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            # Reap only after the final possible process-group signal. The
+            # cleanup lock prevents another thread from signaling this ID.
             try:
                 process.wait(timeout=0.3)
             except subprocess.TimeoutExpired:
-                pass
-        process._qwen_cleanup_complete = process.poll() is not None
+                process._qwen_cleanup_error = 'The owned local runner did not stop within its cleanup budget.'
+                raise LocalQwenError('cleanup_failed', process._qwen_cleanup_error) from None
+        except PermissionError:
+            # Some systems return EPERM for an exited group whose leader has
+            # not yet been reaped. Reap once and never signal this ID again.
+            # A live leader still makes the cleanup fail; an exited leader
+            # does not independently prove that all descendants have exited.
+            try:
+                process.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                process._qwen_cleanup_error = 'The owned local runner process group could not be stopped.'
+                raise LocalQwenError('cleanup_failed', process._qwen_cleanup_error) from None
+            process._qwen_group_cleanup_verified = False
+            process._qwen_cleanup_complete = True
+            return
+        process._qwen_group_cleanup_verified = True
+        process._qwen_cleanup_complete = True
+
+
+def _cleanup_evidence(process):
+    """Describe leader, group and endpoint evidence without conflating them."""
+    if not process._qwen_cleanup_complete or process.returncode is None:
+        raise LocalQwenError('cleanup_failed', 'The owned local runner leader did not stop.')
+    endpoint_released = not _port_busy()
+    evidence = {'server_stopped': True, 'server_stop_scope': 'owned runner leader',
+                'endpoint_released': endpoint_released,
+                'process_group_stop_confirmed': process._qwen_group_cleanup_verified and endpoint_released}
+    limitations = []
+    if not process._qwen_group_cleanup_verified:
+        limitations.append('The operating system denied a process-group signal; surviving descendants were not independently verified.')
+    if not endpoint_released:
+        limitations.append('The configured loopback endpoint is still occupied; endpoint release was not confirmed.')
+    if limitations:
+        evidence['cleanup_limitation'] = ' '.join(limitations)
+    return evidence
 
 
 def _owns_endpoint(process, deadline):
@@ -347,15 +393,17 @@ def run(prompt, deadline, job, root):
                     'cleanup': 'keep_alive:0 then stop owned runner'}
             return parsed, native
         finally:
-            if watchdog is not None:
-                watchdog.cancel()
-            if process is not None:
-                _stop_owned(process)
-            if watchdog is not None:
-                watchdog.join(timeout=1)
-            for sig, handler in prior_handlers.items():
-                signal.signal(sig, handler)
-            if process is not None and process.poll() is None:
+            try:
+                if watchdog is not None:
+                    watchdog.cancel()
+                if process is not None:
+                    _stop_owned(process)
+            finally:
+                if watchdog is not None:
+                    watchdog.join(timeout=1)
+                for sig, handler in prior_handlers.items():
+                    signal.signal(sig, handler)
+            if process is not None and not process._qwen_cleanup_complete:
                 raise LocalQwenError('cleanup_failed', 'The local runner did not stop; the job cannot be treated as complete.')
             if parsed is not None:
-                parsed['local_runtime']['server_stopped'] = True
+                parsed['local_runtime'].update(_cleanup_evidence(process))

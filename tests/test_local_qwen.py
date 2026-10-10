@@ -252,6 +252,13 @@ class LocalInstallation(unittest.TestCase):
         self.assertEqual(parsed['usage']['input_tokens'], 10)
         self.assertEqual(parsed['local_runtime']['runner_version'], 'contract-test')
         self.assertTrue(parsed['local_runtime']['server_stopped'])
+        self.assertEqual(parsed['local_runtime']['server_stop_scope'], 'owned runner leader')
+        self.assertTrue(parsed['local_runtime']['endpoint_released'])
+        group_confirmed = parsed['local_runtime']['process_group_stop_confirmed']
+        self.assertIsInstance(group_confirmed, bool)
+        if not group_confirmed:
+            self.assertIn('surviving descendants were not independently verified',
+                          parsed['local_runtime']['cleanup_limitation'])
         self.assertEqual(native['done_reason'], 'stop')
         calls = [json.loads(line) for line in (self.root / 'calls.jsonl').read_text().splitlines()]
         self.assertEqual([call['route'] for call in calls], ['/api/version', '/api/tags', '/api/show', '/api/chat'])
@@ -323,17 +330,96 @@ class LocalPayloadAndMCP(unittest.TestCase):
 
     def test_timeout_and_main_cleanup_signal_each_owned_group_once(self):
         process = types.SimpleNamespace(pid=424242, _qwen_cleanup_lock=threading.Lock(),
-                                        _qwen_cleanup_complete=False)
-        waits = []
-        process.wait = lambda timeout: waits.append(timeout)
-        process.poll = lambda: 0 if waits else None
-        with mock.patch.object(q.os, 'killpg') as killed:
+                                        _qwen_cleanup_complete=False, returncode=None)
+        events = []
+        def wait(timeout):
+            events.append(('wait', timeout))
+            process.returncode = 0
+        process.wait = wait
+        process.poll = mock.Mock(side_effect=AssertionError('Cleanup must not reap before its final signal.'))
+        with mock.patch.object(q.os, 'killpg', side_effect=lambda pid, sig: events.append(('signal', sig))) as killed, \
+                mock.patch.object(q.time, 'sleep', side_effect=lambda seconds: events.append(('grace', seconds))):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(q._stop_owned, process) for _ in range(2)]
                 for future in futures:
                     future.result(1)
         self.assertEqual(killed.call_args_list, [mock.call(424242, signal.SIGTERM), mock.call(424242, signal.SIGKILL)])
+        self.assertEqual(events, [('signal', signal.SIGTERM), ('grace', 0.3), ('signal', signal.SIGKILL), ('wait', 0.3)])
         self.assertTrue(process._qwen_cleanup_complete)
+
+    def test_reaped_leader_is_never_signaled_and_cleanup_is_not_claimed(self):
+        process = types.SimpleNamespace(pid=424242, _qwen_cleanup_lock=threading.Lock(),
+                                        _qwen_cleanup_complete=False, returncode=0)
+        with mock.patch.object(q.os, 'killpg') as killed:
+            for _ in range(2):
+                with self.assertRaises(q.LocalQwenError) as caught:
+                    q._stop_owned(process)
+                self.assertEqual(caught.exception.code, 'cleanup_failed')
+        killed.assert_not_called()
+        self.assertFalse(process._qwen_cleanup_complete)
+
+    def test_permission_error_does_not_claim_cleanup_or_repeatedly_signal(self):
+        process = types.SimpleNamespace(pid=424242, _qwen_cleanup_lock=threading.Lock(),
+                                        _qwen_cleanup_complete=False, returncode=None)
+        process.wait = mock.Mock(side_effect=subprocess.TimeoutExpired('synthetic-runner', 0.3))
+        process.poll = mock.Mock(side_effect=AssertionError('A denied group signal must not reap and retry.'))
+        with mock.patch.object(q.os, 'killpg', side_effect=PermissionError) as killed:
+            for _ in range(2):
+                with self.assertRaises(q.LocalQwenError) as caught:
+                    q._stop_owned(process)
+                self.assertEqual(caught.exception.code, 'cleanup_failed')
+        self.assertEqual(killed.call_count, 1)
+        process.wait.assert_called_once_with(timeout=0.3)
+        self.assertFalse(process._qwen_cleanup_complete)
+
+    def test_permission_error_after_exit_reports_group_verification_limit(self):
+        process = types.SimpleNamespace(pid=424242, _qwen_cleanup_lock=threading.Lock(),
+                                        _qwen_cleanup_complete=False, returncode=None)
+        def wait(timeout):
+            process.returncode = 0
+            return 0
+        process.wait = mock.Mock(side_effect=wait)
+        process.poll = mock.Mock(side_effect=AssertionError('Cleanup must not reap before its final signal.'))
+        with mock.patch.object(q.os, 'killpg', side_effect=[None, PermissionError]) as killed, \
+                mock.patch.object(q.time, 'sleep'):
+            q._stop_owned(process)
+            q._stop_owned(process)
+        self.assertEqual(killed.call_args_list, [mock.call(424242, signal.SIGTERM), mock.call(424242, signal.SIGKILL)])
+        process.wait.assert_called_once_with(timeout=0.3)
+        self.assertTrue(process._qwen_cleanup_complete)
+        self.assertFalse(process._qwen_group_cleanup_verified)
+
+    def test_missing_group_reaps_leader_without_a_second_group_signal(self):
+        process = types.SimpleNamespace(pid=424242, _qwen_cleanup_lock=threading.Lock(),
+                                        _qwen_cleanup_complete=False, returncode=None)
+        def wait(timeout):
+            process.returncode = 0
+        process.wait = mock.Mock(side_effect=wait)
+        with mock.patch.object(q.os, 'killpg', side_effect=ProcessLookupError) as killed:
+            q._stop_owned(process)
+        self.assertEqual(killed.call_args_list, [mock.call(424242, signal.SIGTERM)])
+        process.wait.assert_called_once_with(timeout=0.3)
+        self.assertTrue(process._qwen_cleanup_complete)
+        self.assertTrue(process._qwen_group_cleanup_verified)
+
+    def test_cleanup_receipt_does_not_claim_a_busy_endpoint_was_released(self):
+        process = types.SimpleNamespace(returncode=0, _qwen_cleanup_complete=True,
+                                        _qwen_group_cleanup_verified=True)
+        with mock.patch.object(q, '_port_busy', return_value=True):
+            evidence = q._cleanup_evidence(process)
+        self.assertTrue(evidence['server_stopped'])
+        self.assertEqual(evidence['server_stop_scope'], 'owned runner leader')
+        self.assertFalse(evidence['endpoint_released'])
+        self.assertFalse(evidence['process_group_stop_confirmed'])
+        self.assertIn('endpoint release was not confirmed', evidence['cleanup_limitation'])
+
+    def test_live_runner_never_produces_a_stopped_receipt(self):
+        process = types.SimpleNamespace(returncode=None, _qwen_cleanup_complete=False)
+        with mock.patch.object(q, '_port_busy') as probe:
+            with self.assertRaises(q.LocalQwenError) as caught:
+                q._cleanup_evidence(process)
+        self.assertEqual(caught.exception.code, 'cleanup_failed')
+        probe.assert_not_called()
 
     def test_bad_native_results_are_not_complete_answers(self):
         cases = [native_answer(done=False), native_answer(done_reason='length'),

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import signal
 import sys
 import tempfile
 import time
@@ -386,6 +387,65 @@ class BridgeTests(unittest.TestCase):
         with patch.object(b, 'MAX_OUTPUT', 100), self.assertRaises(b.BridgeError) as raised:
             b._run([sys.executable, '-c', 'print("x" * 1000)'], self.root, 3)
         self.assertEqual(raised.exception.code, 'output_limit')
+
+    def test_cleanup_does_not_signal_an_already_reaped_group(self):
+        process = types.SimpleNamespace(pid=12345, returncode=0)
+        with patch.object(b.os, 'killpg') as kill:
+            b._stop(process)
+        kill.assert_not_called()
+
+    def test_cleanup_permission_denied_is_only_a_race_after_exit(self):
+        from unittest.mock import Mock
+        process = Mock(pid=12345, returncode=None)
+        process.poll.return_value = 0
+        with patch.object(b.os, 'killpg', side_effect=PermissionError()) as kill:
+            b._stop(process)
+        self.assertEqual(kill.call_count, 1)
+        process.wait.assert_not_called()
+
+    def test_cleanup_permission_denied_for_live_provider_is_failure(self):
+        from unittest.mock import Mock
+        process = Mock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        with patch.object(b.os, 'killpg', side_effect=PermissionError()), self.assertRaises(b.BridgeError) as caught:
+            b._stop(process)
+        self.assertEqual(caught.exception.code, 'cleanup_failed')
+
+    def test_output_limit_cleanup_stops_child_that_ignores_term(self):
+        ready = self.root / 'synthetic-child-ready'
+        survived = self.root / 'synthetic-child-survived'
+        child = ('import pathlib,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+            'pathlib.Path(' + repr(str(ready)) + ').write_text("ready");'
+            'time.sleep(0.8);pathlib.Path(' + repr(str(survived)) + ').write_text("survived")')
+        parent = ('import pathlib,subprocess,sys,time;'
+            'subprocess.Popen([sys.executable,"-c",' + repr(child) + ']);'
+            '\nwhile not pathlib.Path(' + repr(str(ready)) + ').exists(): time.sleep(0.01)'
+            '\nprint("x"*1000,flush=True)')
+        with patch.object(b, 'MAX_OUTPUT', 100), self.assertRaises(b.BridgeError) as caught:
+            b._run([sys.executable, '-c', parent], self.root, 5)
+        self.assertEqual(caught.exception.code, 'output_limit')
+        self.assertTrue(ready.exists(), 'The synthetic child must install its TERM handler before cleanup.')
+        time.sleep(0.8)
+        self.assertFalse(survived.exists(), 'Cleanup must stop descendants even when the leader has exited.')
+
+    def test_cleanup_failure_still_closes_all_provider_pipes(self):
+        launched = []
+        original_spawn = b.subprocess.Popen
+        def capture(*args, **kwargs):
+            process = original_spawn(*args, **kwargs)
+            launched.append(process)
+            return process
+        try:
+            with patch.object(b.subprocess, 'Popen', side_effect=capture), \
+                 patch.object(b, '_stop', side_effect=b.BridgeError('cleanup_failed', 'Synthetic cleanup failure.')), \
+                 self.assertRaises(b.BridgeError) as caught:
+                b._run([sys.executable, '-c', 'print("synthetic")'], self.root, 3)
+            self.assertEqual(caught.exception.code, 'cleanup_failed')
+            self.assertTrue(all(stream.closed for process in launched
+                for stream in (process.stdin, process.stdout, process.stderr)))
+        finally:
+            for process in launched:
+                process.wait(timeout=3)
 
     def test_worker_rejects_success_exit_with_semantic_error(self):
         submitted = self.submit()
