@@ -33,11 +33,14 @@ def native_answer(**changes):
 
 
 FAKE_RUNNER = '''import sys
+print('synthetic-stage: interpreter-started',file=sys.stderr,flush=True)
 if '--self-check' in sys.argv:
  import json
  print(json.dumps({'isolated':sys.flags.isolated,'no_site':sys.flags.no_site}))
  sys.exit(0)
-import http.server,json,os,time
+print('synthetic-stage: before-http-import',file=sys.stderr,flush=True)
+import http.server,json,os,time,socket,socketserver
+print('synthetic-stage: imports-complete',file=sys.stderr,flush=True)
 from pathlib import Path
 models=Path(os.environ['OLLAMA_MODELS'])
 root=models.parents[1]
@@ -68,8 +71,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
   else: out={'error':'unexpected route'}
   raw=json.dumps(out,ensure_ascii=False).encode()
   self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+def forbidden_reverse_dns(*args,**kwargs):
+ raise AssertionError('The loopback-only synthetic server must not resolve hostnames.')
+socket.getfqdn=forbidden_reverse_dns
+socket.gethostbyaddr=forbidden_reverse_dns
+class LoopbackHTTPServer(http.server.HTTPServer):
+ def server_bind(self):
+  # HTTPServer normally calls getfqdn between bind and listen. The fixture
+  # needs only a numeric loopback address and must not depend on hosted DNS.
+  socketserver.TCPServer.server_bind(self)
+  self.server_name='localhost'
+  self.server_port=self.server_address[1]
 host,port=os.environ['OLLAMA_HOST'].split(':')
-http.server.HTTPServer((host,int(port)),Handler).serve_forever()
+print('synthetic-stage: before-loopback-bind',file=sys.stderr,flush=True)
+server=LoopbackHTTPServer((host,int(port)),Handler)
+print('synthetic-stage: listening',file=sys.stderr,flush=True)
+server.serve_forever()
 '''
 
 
@@ -114,8 +131,17 @@ class LocalInstallation(unittest.TestCase):
         self.temp.cleanup()
 
     def run_fake(self, prompt, deadline, job, root):
+        owned = []
+        original_spawn = q.subprocess.Popen
+        binary, _, _ = q._paths(root)
+        def traced_spawn(*args, **kwargs):
+            process = original_spawn(*args, **kwargs)
+            if args[0][:2] == [str(binary), 'serve']:
+                owned.append(process)
+            return process
         try:
-            return q.run(prompt, deadline, job, root)
+            with mock.patch.object(q.subprocess, 'Popen', side_effect=traced_spawn):
+                return q.run(prompt, deadline, job, root)
         except q.LocalQwenError as error:
             # Only synthetic diagnostics are exposed here; production output
             # remains in the private job directory.
@@ -123,6 +149,7 @@ class LocalInstallation(unittest.TestCase):
             diagnostic = log.read_text(errors='replace')[:4000] if log.exists() else '(no synthetic runner log)'
             raise q.LocalQwenError(error.code, str(error) +
                 '\nSynthetic interpreter: ' + self.interpreter +
+                '\nSynthetic owned exit codes: ' + str([process.returncode for process in owned]) +
                 '\nSynthetic runner diagnostic:\n' + diagnostic, error.state) from None
 
     def test_synthetic_interpreter_launches_with_stripped_environment(self):
@@ -248,6 +275,9 @@ class LocalInstallation(unittest.TestCase):
         self.assertIsNone(calls[-1]['env']['OPENAI_API_KEY'])
         self.assertIsNone(calls[-1]['env']['HTTPS_PROXY'])
         self.assertFalse(q._port_busy())
+        diagnostic = (self.job / 'local-runner.log').read_text()
+        self.assertIn('synthetic-stage: imports-complete', diagnostic)
+        self.assertIn('synthetic-stage: listening', diagnostic)
         self.assertEqual(stat.S_IMODE((self.job / 'local-runner.log').stat().st_mode), 0o600)
 
     def test_incomplete_answer_stops_owned_runtime(self):
