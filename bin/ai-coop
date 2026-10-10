@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+task_source_dir=$(CDPATH= cd -- "$(dirname -- "${0}")/.." && pwd)
+exec "${AI_COOP_PYTHON:-python3}" "$task_source_dir/bridge.py" "$@"

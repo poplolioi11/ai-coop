@@ -1,0 +1,15 @@
+name: Offline verification
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify published file set and checksums
+        run: python3 verify_release.py
+      - name: Run synthetic tests without model requests
+        run: python3 -m unittest discover -s tests -q

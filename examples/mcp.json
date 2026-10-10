@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-coop": {
+      "command": "python3",
+      "args": ["/absolute/path/to/ai-coop/server.py"]
+    }
+  }
+}
