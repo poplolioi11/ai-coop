@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import socket
 import stat
 import subprocess
@@ -31,7 +32,11 @@ def native_answer(**changes):
     return answer
 
 
-FAKE_RUNNER = '#!' + sys.executable + '''
+FAKE_RUNNER = '''import sys
+if '--self-check' in sys.argv:
+ import json
+ print(json.dumps({'isolated':sys.flags.isolated,'no_site':sys.flags.no_site}))
+ sys.exit(0)
 import http.server,json,os,time
 from pathlib import Path
 models=Path(os.environ['OLLAMA_MODELS'])
@@ -79,7 +84,14 @@ class LocalInstallation(unittest.TestCase):
         (self.root / 'slots').mkdir()
         binary, models, manifest = q._paths(self.root)
         binary.parent.mkdir(parents=True)
-        binary.write_text(FAKE_RUNNER)
+        # Hosted CI interpreters may have launchers or site customizations.
+        # Execute only this stdlib fixture with a resolved interpreter; the
+        # shell wrapper also handles spaces and long interpreter paths.
+        self.interpreter = str(Path(sys.executable).resolve())
+        fixture = binary.parent / 'synthetic runner.py'
+        fixture.write_text(FAKE_RUNNER)
+        binary.write_text('#!/bin/sh\nexec ' + shlex.join(
+            [self.interpreter, '-I', '-S', str(fixture)]) + ' "$@"\n')
         binary.chmod(0o700)
         manifest.parent.mkdir(parents=True)
         (models / 'blobs').mkdir()
@@ -100,6 +112,26 @@ class LocalInstallation(unittest.TestCase):
         self.port_patch.stop()
         self.binary_environment.stop()
         self.temp.cleanup()
+
+    def run_fake(self, prompt, deadline, job, root):
+        try:
+            return q.run(prompt, deadline, job, root)
+        except q.LocalQwenError as error:
+            # Only synthetic diagnostics are exposed here; production output
+            # remains in the private job directory.
+            log = Path(job) / 'local-runner.log'
+            diagnostic = log.read_text(errors='replace')[:4000] if log.exists() else '(no synthetic runner log)'
+            raise q.LocalQwenError(error.code, str(error) +
+                '\nSynthetic interpreter: ' + self.interpreter +
+                '\nSynthetic runner diagnostic:\n' + diagnostic, error.state) from None
+
+    def test_synthetic_interpreter_launches_with_stripped_environment(self):
+        binary, _, _ = q._paths(self.root)
+        result = subprocess.run([str(binary), '--self-check'],
+            env={'HOME': str(self.root / 'empty-home'), 'PATH': '/usr/bin:/bin'},
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {'isolated': 1, 'no_site': 1})
 
     def add_v2_wrapper(self):
         _, models, manifest = q._paths(self.root)
@@ -125,7 +157,7 @@ class LocalInstallation(unittest.TestCase):
         self.assertEqual(status['model_manifest_raw_sha256'], hashlib.sha256(anchor.read_bytes()).hexdigest())
         self.assertNotEqual(status['model_manifest_digest'], 'sha256:' + status['model_manifest_raw_sha256'])
         self.assertEqual(status['model_manifest_canonical_path'], str(v2))
-        parsed, _ = q.run('整理合成文字。', time.monotonic() + 5, self.job, self.root)
+        parsed, _ = self.run_fake('整理合成文字。', time.monotonic() + 5, self.job, self.root)
         self.assertEqual(parsed['local_runtime']['api_model_digest'], digest)
         self.assertEqual(parsed['local_runtime']['model_manifest_digest'], 'sha256:' + digest)
         self.assertEqual(parsed['local_runtime']['presence_penalty'], 0)
@@ -165,7 +197,7 @@ class LocalInstallation(unittest.TestCase):
         (models / 'blobs' / descriptor['digest'].replace(':', '-')).write_text('broken')
         with mock.patch.object(q.subprocess, 'Popen') as launched:
             with self.assertRaises(q.LocalQwenError) as caught:
-                q.run('任務', time.monotonic() + 3, self.job, self.root)
+                self.run_fake('任務', time.monotonic() + 3, self.job, self.root)
         self.assertEqual(caught.exception.code, 'model_unavailable')
         launched.assert_not_called()
 
@@ -175,7 +207,7 @@ class LocalInstallation(unittest.TestCase):
             listener.listen(1)
             with mock.patch.object(q.subprocess, 'Popen') as launched, mock.patch.object(q, '_http') as http:
                 with self.assertRaises(q.LocalQwenError) as caught:
-                    q.run('任務', time.monotonic() + 3, self.job, self.root)
+                    self.run_fake('任務', time.monotonic() + 3, self.job, self.root)
             self.assertEqual(caught.exception.code, 'local_endpoint_busy')
             self.assertEqual(listener.getsockname()[1], self.port)
         launched.assert_not_called()
@@ -187,7 +219,7 @@ class LocalInstallation(unittest.TestCase):
         (shared_home / '.ollama/config.json').write_text('unrelated shared settings')
         (shared_home / '.ollama/id_ed25519').write_text('synthetic shared identity sentinel')
         with mock.patch.dict(os.environ, {'HOME': str(shared_home), 'OPENAI_API_KEY': 'DUMMY_NEVER_FORWARD', 'HTTPS_PROXY': 'http://never.invalid'}):  # ai-coop-synthetic-secret
-            parsed, native = q.run('只整理明示文字。', time.monotonic() + 5, self.job, self.root)
+            parsed, native = self.run_fake('只整理明示文字。', time.monotonic() + 5, self.job, self.root)
         self.assertEqual(parsed['answer'], '已整理供核對。')
         self.assertEqual(parsed['actual_model'], q.MODEL)
         self.assertEqual(parsed['usage']['input_tokens'], 10)
@@ -221,7 +253,7 @@ class LocalInstallation(unittest.TestCase):
     def test_incomplete_answer_stops_owned_runtime(self):
         (self.root / 'mode.txt').write_text('length')
         with self.assertRaises(q.LocalQwenError) as caught:
-            q.run('任務', time.monotonic() + 5, self.job, self.root)
+            self.run_fake('任務', time.monotonic() + 5, self.job, self.root)
         self.assertEqual(caught.exception.code, 'incomplete_output')
         self.assertFalse(q._port_busy())
         raw = json.loads((self.job / 'provider.json').read_text())
@@ -233,7 +265,7 @@ class LocalInstallation(unittest.TestCase):
         (self.root / 'mode.txt').write_text('timeout')
         began = time.monotonic()
         with self.assertRaises(q.LocalQwenError) as caught:
-            q.run('任務', began + 1.2, self.job, self.root)
+            self.run_fake('任務', began + 1.2, self.job, self.root)
         self.assertEqual(caught.exception.code, 'timeout')
         self.assertLess(time.monotonic() - began, 3)
         self.assertFalse(q._port_busy())
@@ -243,7 +275,7 @@ class LocalInstallation(unittest.TestCase):
     def test_failed_ownership_proof_never_submits_model_request(self):
         with mock.patch.object(q, '_owns_endpoint', return_value=False), mock.patch.object(q, '_http') as http:
             with self.assertRaises(q.LocalQwenError) as caught:
-                q.run('任務', time.monotonic() + 5, self.job, self.root)
+                self.run_fake('任務', time.monotonic() + 5, self.job, self.root)
         self.assertEqual(caught.exception.code, 'local_endpoint_unverified')
         http.assert_not_called()
         self.assertFalse(q._port_busy())
